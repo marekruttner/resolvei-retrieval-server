@@ -1,0 +1,54 @@
+name: Build & Push Resolvei Docker Image
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1) Check out the code
+      - name: Check out code
+        uses: actions/checkout@v3
+
+      # 2) (Optional) Set up QEMU (needed if building multi-platform images)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # 3) (Optional) Set up Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4) Log in to GitHub Container Registry
+      - name: Log in to GHCR
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 5) Build and push the Docker image
+      - name: Build and push Resolvei image
+        uses: docker/build-push-action@v4
+        with:
+          # If your Dockerfile is at the root of your repo:
+          context: .
+          # If the Dockerfile is in a subfolder, e.g., "resolvei/", do:
+          #   context: resolvei
+          #   dockerfile: resolvei/Dockerfile
+
+          # Build for a single platform (linux/amd64).
+          # If you need multi-arch, you can specify more (e.g. linux/arm64)
+          platforms: linux/amd64
+
+          # Publish the image to GHCR
+          push: true
+
+          # The tag for your image.
+          # For example: ghcr.io/<owner>/<repo>:resolvei-latest
+          tags: |
+            ghcr.io/${{ github.repository }}:resolvei-latest
+          # Optionally push multiple tags, e.g., :latest, :<commit-sha>, etc.
