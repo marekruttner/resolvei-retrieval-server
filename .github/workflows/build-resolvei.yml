@@ -51,6 +51,4 @@ jobs:
 
           tags: |
             ghcr.io/${{ github.repository }}:resolvei-latest
-            # Optionally add more tags:
-            # ghcr.io/${{ github.repository }}:${{ github.sha }}
 
