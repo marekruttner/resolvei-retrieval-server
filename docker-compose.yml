@@ -1,3 +1,4 @@
+version: "3.9"
 services:
   etcd:
     container_name: milvus-etcd-roles
@@ -121,30 +122,59 @@ services:
 
   resolvei:
     container_name: resolvei-roles
-    # If you have a Dockerfile locally, you could do:
-    # build: .
-    # or if you have an image hosted (e.g. GHCR or Docker Hub):
     image: ghcr.io/yourorg/resolvei:latest
     environment:
-      # Add environment variables as needed
       - DB_HOST=db
       - DB_USER=admin
       - DB_PASSWORD=adminadmin
       - NEO4J_URI=neo4j://neo4j-roles:7687
       - NEO4J_USER=neo4j
       - NEO4J_PASSWORD=testtest
-      # etc...
     ports:
-      - "8000:8000"  # example: if your Resolvei app listens on 8000
+      - "8000:8000"
     depends_on:
       - db
       - standalone
       - neo4j
 
   ollama:
-    container_name: ollama-roles
+    container_name: ollama
     image: ghcr.io/jmorganca/ollama:latest
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        ollama pull phi4:latest
+        exec ollama serve
     ports:
       - "11411:11411"
+
+  ################################################################
+  # New Tailscale service for VPN
+  ################################################################
+  tailscale:
+    container_name: tailscale
+    image: tailscale/tailscale:stable
+    # We'll use the host network so that you can reach all
+    # exposed ports via your host's Tailscale IP.
+    network_mode: host
+    privileged: true
     volumes:
-      - ./ollama-data:/root/.ollama
+      - tailscale-data:/var/lib/tailscale
+    environment:
+      # Provide your Tailscale auth key here, e.g.:
+      # TS_AUTHKEY=tskey-abc123...
+      - TS_AUTHKEY=tskey-auth-k3A2ottBSW11CNTRL-bbZtpGnFpaFUjcaoVC9DbFWaSniEytubf
+    # We'll run tailscaled in the background, then "tailscale up".
+    command: >
+      sh -c "
+        tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+        # Wait a moment for tailscaled to start
+        sleep 3
+        tailscale up --accept-routes --hostname='resolvei-docker' --authkey=${TS_AUTHKEY}
+        # Keep container running
+        tail -f /dev/null
+      "
+
+volumes:
+  tailscale-data:
