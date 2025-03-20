@@ -5,6 +5,7 @@ annotated-types
 anyio
 asgiref
 attrs
+azure-storage-blob
 backoff
 bcrypt
 beautifulsoup4
