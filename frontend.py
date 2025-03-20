@@ -86,11 +86,12 @@ model_lock = threading.Lock()
 llm_lock = threading.Lock()
 
 # Initialize backend (Milvus, Neo4j, Models)
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j-roles:7687")  # Change from localhost
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "testtest")
-MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
-MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+
+MILVUS_HOST = os.getenv("MILVUS_HOST", "standalone")  # Change from localhost
+MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 
 backend.initialize_all(
     neo4j_uri=NEO4J_URI,
