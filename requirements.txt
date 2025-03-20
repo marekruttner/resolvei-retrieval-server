@@ -6,6 +6,7 @@ anyio
 asgiref
 attrs
 azure-storage-blob
+google-api-python-client
 backoff
 bcrypt
 beautifulsoup4
@@ -67,6 +68,7 @@ monotonic
 mpmath
 multidict
 mypy-extensions
+msal
 neo4j
 networkx
 numpy
