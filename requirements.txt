@@ -9,6 +9,7 @@ backoff
 bcrypt
 beautifulsoup4
 build
+boto3
 cachetools
 certifi
 charset-normalizer
