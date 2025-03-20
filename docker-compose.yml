@@ -171,10 +171,8 @@ services:
     command: >
       sh -c "
         tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
-        # Wait a moment for tailscaled to start
         sleep 3
         tailscale up --accept-routes --hostname='resolvei-docker' --authkey=${TS_AUTHKEY}
-        # Keep container running
         tail -f /dev/null
       "
 

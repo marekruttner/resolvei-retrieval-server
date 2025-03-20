@@ -1352,7 +1352,7 @@ def evaluate_system(request_data: EvaluationRequest):
 
     # Compute generative (text) metrics if ground truth answers exist
     if all_predictions and all_references:
-        generative_metrics = com    pute_text_metrics(all_predictions, all_references)
+        generative_metrics = compute_text_metrics(all_predictions, all_references)
         writer.add_scalar("generative/rouge1_f", generative_metrics["rouge1_f"], 0)
         writer.add_scalar("generative/rouge2_f", generative_metrics["rouge2_f"], 0)
         writer.add_scalar("generative/rougeL_f", generative_metrics["rougeL_f"], 0)
