@@ -1,0 +1,524 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: etcd-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd
+  labels:
+    app: etcd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      labels:
+        app: etcd
+    spec:
+      containers:
+      - name: etcd
+        image: quay.io/coreos/etcd:v3.5.5
+        command:
+          - "etcd"
+          - "-advertise-client-urls=http://127.0.0.1:2379"
+          - "-listen-client-urls"
+          - "http://0.0.0.0:2379"
+          - "--data-dir"
+          - "/etcd"
+        env:
+          - name: ETCD_AUTO_COMPACTION_MODE
+            value: "revision"
+          - name: ETCD_AUTO_COMPACTION_RETENTION
+            value: "1000"
+          - name: ETCD_QUOTA_BACKEND_BYTES
+            value: "4294967296"
+          - name: ETCD_SNAPSHOT_COUNT
+            value: "50000"
+        ports:
+          - containerPort: 2379
+        volumeMounts:
+          - name: etcd-data
+            mountPath: /etcd
+        livenessProbe:
+          exec:
+            command: ["etcdctl", "endpoint", "health"]
+          initialDelaySeconds: 10
+          periodSeconds: 30
+      volumes:
+        - name: etcd-data
+          persistentVolumeClaim:
+            claimName: etcd-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd-service
+spec:
+  selector:
+    app: etcd
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+  clusterIP: None
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+        command: ["minio", "server", "/minio_data", "--console-address", ":9001"]
+        env:
+          - name: MINIO_ACCESS_KEY
+            value: "minioadmin"
+          - name: MINIO_SECRET_KEY
+            value: "minioadmin"
+        ports:
+          - containerPort: 9000
+          - containerPort: 9001
+        volumeMounts:
+          - name: minio-data
+            mountPath: /minio_data
+        livenessProbe:
+          httpGet:
+            path: /minio/health/live
+            port: 9000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+      volumes:
+        - name: minio-data
+          persistentVolumeClaim:
+            claimName: minio-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-service
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: minio
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: milvus-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-standalone
+  labels:
+    app: milvus-standalone
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus-standalone
+  template:
+    metadata:
+      labels:
+        app: milvus-standalone
+    spec:
+      containers:
+      - name: milvus-standalone
+        image: milvusdb/milvus:v2.4.13  # CPU version of Milvus
+        command: ["milvus", "run", "standalone"]
+        env:
+          - name: ETCD_ENDPOINTS
+            value: "etcd-service:2379"
+          - name: MINIO_ADDRESS
+            value: "minio-service:9000"
+        ports:
+          - containerPort: 19530
+          - containerPort: 9091
+        volumeMounts:
+          - name: milvus-data
+            mountPath: /var/lib/milvus
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 19530
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+        - name: milvus-data
+          persistentVolumeClaim:
+            claimName: milvus-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-service
+spec:
+  selector:
+    app: milvus-standalone
+  ports:
+    - name: milvus
+      port: 19530
+      targetPort: 19530
+    - name: web
+      port: 9091
+      targetPort: 9091
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neo4j-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo4j
+  labels:
+    app: neo4j
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neo4j
+  template:
+    metadata:
+      labels:
+        app: neo4j
+    spec:
+      containers:
+      - name: neo4j
+        image: neo4j:5.5
+        env:
+          - name: NEO4J_AUTH
+            value: "neo4j/testtest"
+        ports:
+          - containerPort: 7687
+          - containerPort: 7474
+        volumeMounts:
+          - name: neo4j-data
+            mountPath: /data
+      volumes:
+        - name: neo4j-data
+          persistentVolumeClaim:
+            claimName: neo4j-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j-service
+spec:
+  selector:
+    app: neo4j
+  ports:
+    - name: bolt
+      port: 7687
+      targetPort: 7687
+    - name: http
+      port: 7474
+      targetPort: 7474
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+data:
+  init.sql: |
+    -- Place your SQL initialization commands here
+    CREATE TABLE example (id SERIAL PRIMARY KEY, name TEXT);
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  labels:
+    app: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15
+        env:
+          - name: POSTGRES_USER
+            value: "admin"
+          - name: POSTGRES_PASSWORD
+            value: "adminadmin"
+          - name: POSTGRES_DB
+            value: "chatdb"
+          - name: POSTGRES_HOST_AUTH_METHOD
+            value: "trust"
+        ports:
+          - containerPort: 5432
+        volumeMounts:
+          - name: postgres-data
+            mountPath: /var/lib/postgresql/data
+          - name: init-sql
+            mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: postgres-pvc
+        - name: init-sql
+          configMap:
+            name: postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgadmin
+  labels:
+    app: pgadmin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pgadmin
+  template:
+    metadata:
+      labels:
+        app: pgadmin
+    spec:
+      containers:
+      - name: pgadmin
+        image: dpage/pgadmin4:8.13.0
+        env:
+          - name: PGADMIN_DEFAULT_EMAIL
+            value: "admin@admin.com"
+          - name: PGADMIN_DEFAULT_PASSWORD
+            value: "adminadmin"
+        ports:
+          - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pgadmin-service
+spec:
+  selector:
+    app: pgadmin
+  ports:
+    - name: pgadmin
+      port: 5050
+      targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: attu
+  labels:
+    app: attu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: attu
+  template:
+    metadata:
+      labels:
+        app: attu
+    spec:
+      containers:
+      - name: attu
+        image: zilliz/attu:v2.4.11
+        env:
+          - name: MILVUS_URL
+            value: "milvus-service:19530"
+        ports:
+          - containerPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: attu-service
+spec:
+  selector:
+    app: attu
+  ports:
+    - name: attu
+      port: 8800
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: resolvei
+  labels:
+    app: resolvei
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: resolvei
+  template:
+    metadata:
+      labels:
+        app: resolvei
+    spec:
+      containers:
+      - name: resolvei
+        image: ghcr.io/marekruttner/resolvei-retrieval-server:resolvei-latest
+        env:
+          - name: DB_HOST
+            value: "postgres-service"
+          - name: DB_NAME
+            value: "chatdb"
+          - name: DB_USER
+            value: "admin"
+          - name: DB_PASSWORD
+            value: "adminadmin"
+          - name: NEO4J_URI
+            value: "neo4j://neo4j-service:7687"
+          - name: NEO4J_USER
+            value: "neo4j"
+          - name: NEO4J_PASSWORD
+            value: "testtest"
+          - name: MILVUS_HOST
+            value: "milvus-service"
+          - name: MILVUS_PORT
+            value: "19530"
+        ports:
+          - containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: resolvei-service
+spec:
+  selector:
+    app: resolvei
+  ports:
+    - name: resolvei
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  labels:
+    app: ollama
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+          - containerPort: 11434
+        volumeMounts:
+          - name: ollama-data
+            mountPath: /root/.ollama
+      volumes:
+        - name: ollama-data
+          persistentVolumeClaim:
+            claimName: ollama-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama-service
+spec:
+  selector:
+    app: ollama
+  ports:
+    - name: ollama
+      port: 11434
+      targetPort: 11434
