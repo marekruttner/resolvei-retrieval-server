@@ -304,6 +304,7 @@ def create_document_node(doc_id, content, metadata):
     """
     safe_metadata = {}
     for k, v in metadata.items():
+        # Convert numpy types to plain Python floats
         if isinstance(v, (np.integer, np.floating)):
             safe_metadata[k] = float(v)
         else:
@@ -412,7 +413,6 @@ def create_entity_node_and_rel(doc_id, entity_text, label):
         session.write_transaction(_create_entity_node_tx, entity_id, entity_text, label)
         session.write_transaction(_create_mentions_rel_tx, doc_id, entity_id)
 
-
 ###############################################################################
 # Summaries & Entity Extraction
 ###############################################################################
@@ -424,7 +424,7 @@ def summarize_chunk_with_llm(text):
     """
     if summarizer:
         try:
-            # For mT5_multilingual_XLSum, you might adapt max_length, min_length depending on doc language
+            # You can adjust max_length/min_length depending on your use case
             result = summarizer(text, max_length=100, min_length=30, do_sample=False)
             summary = result[0]["summary_text"]
             return summary.strip()
@@ -453,12 +453,11 @@ def detect_language_of_text(text):
 def extract_entities_and_relationships(text):
     """
     We do English-only spaCy-based NER if the text is detected as English.
-    For other languages, we skip NER.
+    For other languages, skip NER.
     If you want fully multilingual NER, load a model that supports those languages.
     """
     lang_code = detect_language_of_text(text)
     if lang_code != "en":
-        # skip NER for non-English
         logger.debug(f"Skipping spaCy NER; doc language detected: {lang_code}")
         return []
 
@@ -470,7 +469,6 @@ def extract_entities_and_relationships(text):
     for ent in doc.ents:
         entities.append((ent.text, ent.label_))
     return entities
-
 
 ###############################################################################
 # Embedding & Similarity
@@ -489,16 +487,11 @@ def store_embeddings_in_collection(doc_ids, embeddings, milvus_collection):
 def store_multi_vector_embeddings(doc_id, chunk_text):
     """
     Generates both semantic and lexical embeddings, stores them in separate collections.
-    GPU is used if available (set when loading the models).
     """
-    # SEMANTIC
-    sem_emb = semantic_embedding_model.encode([chunk_text], show_progress_bar=False)[0]
-    sem_emb = sem_emb.astype(np.float32)
+    sem_emb = semantic_embedding_model.encode([chunk_text], show_progress_bar=False)[0].astype(np.float32)
     store_embeddings_in_collection([doc_id], [sem_emb], semantic_collection)
 
-    # LEXICAL
-    lex_emb = lexical_embedding_model.encode([chunk_text], show_progress_bar=False)[0]
-    lex_emb = lex_emb.astype(np.float32)
+    lex_emb = lexical_embedding_model.encode([chunk_text], show_progress_bar=False)[0].astype(np.float32)
     store_embeddings_in_collection([doc_id], [lex_emb], lexical_collection)
 
 def cosine_similarity(vec1, vec2):
@@ -508,7 +501,6 @@ def compute_batch_similarities(doc_ids, embeddings, relationship_type="SIMILAR_T
     """
     For each embedding, compare with the previous ones in the batch,
     link them if similarity > threshold.
-    Make sure to cast similarity to float.
     """
     for i in range(len(embeddings)):
         for j in range(i):
@@ -528,11 +520,8 @@ def compute_batch_similarities(doc_ids, embeddings, relationship_type="SIMILAR_T
 def chunk_text_with_spacy(doc_text, min_chunk_size=500, max_chunk_size=2000):
     """
     spaCy-based chunking by sentences (English only).
-    If doc is non-English, we won't do a language-based approach; you could skip or use a different model.
+    If doc is non-English, we skip or use a different approach.
     """
-    # Just for demonstration, we do not do language detection here.
-    # If you want, detect language, pick the right spaCy model or fallback, etc.
-
     if not nlp_spacy_en:
         logger.warning("English spaCy not available, using fallback chunking.")
         return [doc_text]
@@ -555,7 +544,6 @@ def chunk_text_with_spacy(doc_text, min_chunk_size=500, max_chunk_size=2000):
             current_chunk.append(sentence_text)
             current_length += len(sentence_text)
 
-    # Add the remainder
     if current_chunk:
         chunks.append(" ".join(current_chunk))
 
@@ -574,7 +562,7 @@ def chunk_text_with_langchain(doc_text, chunk_size=1000, chunk_overlap=200):
 
 def transcribe_video(file_path, whisper_model_size="base"):
     if not whisper:
-        logger.warning("Whisper not installed. Please `pip install openai-whisper` if needed.")
+        logger.warning("Whisper not installed. Please install it if needed.")
         return None
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -683,7 +671,7 @@ def process_chunk(doc_text, file_metadata):
     """
     doc_id = generate_doc_id(doc_text)
 
-    # Summarize chunk text -> create topic node
+    # Summarize chunk
     topic_summary = summarize_chunk_with_llm(doc_text)
     topic_id = generate_doc_id(topic_summary)
     create_topic_node(topic_id, topic_summary)
@@ -698,12 +686,12 @@ def process_chunk(doc_text, file_metadata):
     # Link Document -> Topic
     create_has_topic_relationship(doc_id, topic_id)
 
-    # Entity Extraction -> create MENTIONS relationships (English only here)
+    # Entity Extraction
     entity_list = extract_entities_and_relationships(doc_text)
     for ent_text, ent_label in entity_list:
         create_entity_node_and_rel(doc_id, ent_text, ent_label)
 
-    # Multi-vector embeddings (semantic + lexical)
+    # Multi-vector embeddings
     store_multi_vector_embeddings(doc_id, doc_text)
 
     return doc_id
@@ -711,7 +699,7 @@ def process_chunk(doc_text, file_metadata):
 def process_documents(directory, batch_size=50, use_spacy_chunking=False):
     """
     1. Clears Neo4j graph (fresh start).
-    2. Reads files, chunking them with either spaCy or LangChain.
+    2. Reads files from a local directory, chunking them with either spaCy or LangChain.
     3. For each chunk, processes it (document node, topic node, entity nodes, embeddings).
     4. Batches doc-doc similarity computation for the "SIMILAR_TO" edges.
     """
@@ -732,7 +720,7 @@ def process_documents(directory, batch_size=50, use_spacy_chunking=False):
 
         # Decide chunk approach
         if use_spacy_chunking:
-            # Only really appropriate for English text with the loaded model
+            # Only recommended for English text if spaCy is loaded
             chunks = chunk_text_with_spacy(content, min_chunk_size=500, max_chunk_size=2000)
         else:
             chunks = chunk_text_with_langchain(content, chunk_size=1000, chunk_overlap=200)
@@ -747,7 +735,6 @@ def process_documents(directory, batch_size=50, use_spacy_chunking=False):
     doc_ids_batch = []
     embeddings_semantic_batch = []
 
-    # Process each chunk
     for i, (chunk_text, file_meta) in enumerate(tqdm(all_chunks, desc="Processing chunks")):
         doc_id = process_chunk(chunk_text, file_meta)
         doc_ids_batch.append(doc_id)
@@ -762,6 +749,74 @@ def process_documents(directory, batch_size=50, use_spacy_chunking=False):
             compute_batch_similarities(doc_ids_batch, embeddings_semantic_batch, threshold=0.7)
             doc_ids_batch.clear()
             embeddings_semantic_batch.clear()
+
+###############################################################################
+# New: ingest_file_from_datalake (Optional Helper)
+###############################################################################
+# If you'd like to ingest a file that is already stored in MinIO / S3 / Azure / local,
+# you can call this function. It downloads the file via get_datalake(datalake_type),
+# extracts text, and runs chunk+embed just like process_documents does.
+#
+# Usage (example):
+#   ingest_file_from_datalake("some/path.pdf", datalake_type="minio")
+#   or
+#   ingest_file_from_datalake("some/path/file.docx", datalake_type="s3")
+#
+try:
+    from storage_integrations import get_datalake
+except ImportError:
+    # If you don't have storage_integrations, comment out or remove this.
+    get_datalake = None
+
+def ingest_file_from_datalake(object_path: str, datalake_type: str = "minio"):
+    """
+    1. Download the file from the chosen data lake (MinIO, S3, local, etc.)
+    2. Extract text with read_file_content(...)
+    3. Chunk, embed, store in Neo4j & Milvus
+    """
+    if not get_datalake:
+        logger.warning("storage_integrations.py not available. Skipping ingestion from data lake.")
+        return
+
+    dlake = get_datalake(datalake_type)
+    file_bytes = dlake.load_file(object_path)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_path = os.path.join(tmpdir, os.path.basename(object_path))
+        with open(temp_path, "wb") as f_out:
+            f_out.write(file_bytes)
+
+        content = read_file_content(temp_path)
+        if not content:
+            logger.warning(f"No textual content found for {object_path}")
+            return
+
+        # Choose chunking approach
+        chunks = chunk_text_with_langchain(content, chunk_size=1000, chunk_overlap=200)
+
+        # Some basic metadata
+        meta = {
+            "object_path": object_path,
+            "datalake_type": datalake_type,
+            "word_count": len(content.split())
+        }
+
+        doc_ids_batch = []
+        embeddings_semantic_batch = []
+
+        for ctext in chunks:
+            doc_id = process_chunk(ctext, meta)
+            doc_ids_batch.append(doc_id)
+
+            # For doc-doc similarity
+            sem_emb = semantic_embedding_model.encode([ctext], show_progress_bar=False)[0]
+            embeddings_semantic_batch.append(sem_emb)
+
+        # Link new chunks to each other if similar
+        compute_batch_similarities(doc_ids_batch, embeddings_semantic_batch, threshold=0.7)
+
+    logger.info(f"Ingested file from {datalake_type}: {object_path}")
+
 
 ###############################################################################
 # MAIN

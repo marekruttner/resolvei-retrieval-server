@@ -11,17 +11,29 @@ from msal import ConfidentialClientApplication
 from abc import ABC, abstractmethod
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
+###############################################################################
 # Base Datalake Interface
+###############################################################################
 class DataLake(ABC):
     @abstractmethod
     def save_file_with_metadata(self, file_content: bytes, file_path: str, metadata: dict):
+        """
+        Stores the file bytes under 'file_path', plus writes a .metadata.json
+        or equivalent store containing the 'metadata' dictionary.
+        """
         pass
 
     @abstractmethod
     def load_file(self, file_path: str) -> bytes:
+        """
+        Retrieves raw bytes for the file located at 'file_path'.
+        """
         pass
 
 
+###############################################################################
+# Local Datalake
+###############################################################################
 class LocalFileDataLake(DataLake):
     def __init__(self):
         self.base_path = os.environ.get("LOCAL_DATALAKE_PATH", "local_datalake")
@@ -30,9 +42,11 @@ class LocalFileDataLake(DataLake):
         full_file_path = os.path.join(self.base_path, file_path)
         os.makedirs(os.path.dirname(full_file_path), exist_ok=True)
 
+        # Save the file
         with open(full_file_path, 'wb') as f:
             f.write(file_content)
 
+        # Save metadata to a separate JSON file
         meta_path = full_file_path + ".metadata.json"
         with open(meta_path, 'w', encoding='utf-8') as mf:
             json.dump(metadata, mf, ensure_ascii=False, indent=2)
@@ -43,24 +57,31 @@ class LocalFileDataLake(DataLake):
             return f.read()
 
 
-# S3 Implementation
+###############################################################################
+# S3 Datalake (AWS)
+###############################################################################
 class S3DataLake(DataLake):
     def __init__(self):
+        # Uses standard AWS env vars: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, etc.
         self.s3 = boto3.client(
             's3',
             aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
             aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
             region_name=os.environ.get("AWS_DEFAULT_REGION")
         )
+        # S3 bucket name for storing files
         self.bucket_name = os.environ.get("DATALAKE_BUCKET", "my-datalake-bucket")
 
     def save_file_with_metadata(self, file_content: bytes, file_path: str, metadata: dict):
+        # Put the actual file
         self.s3.put_object(
             Bucket=self.bucket_name,
             Key=file_path,
             Body=file_content,
             Metadata={k: str(v) for k, v in metadata.items() if isinstance(v, (str, int, float))}
         )
+
+        # Put the metadata as .metadata.json
         meta_path = file_path + ".metadata.json"
         self.s3.put_object(
             Bucket=self.bucket_name,
@@ -73,20 +94,26 @@ class S3DataLake(DataLake):
         return resp['Body'].read()
 
 
-# MinIO Implementation (S3-Compatible)
+###############################################################################
+# MinIO Datalake (S3-Compatible)
+###############################################################################
 class MinioDataLake(DataLake):
+    """
+    Identical approach to S3, but uses the MINIO_ENDPOINT & MINIO_BUCKET environment variables.
+    """
     def __init__(self):
         self.minio_client = boto3.client(
             's3',
             endpoint_url=os.environ.get("MINIO_ENDPOINT", "http://localhost:9000"),
             aws_access_key_id=os.environ.get("MINIO_ACCESS_KEY"),
             aws_secret_access_key=os.environ.get("MINIO_SECRET_KEY"),
-            region_name="us-east-1",  # Typically not relevant for MinIO, but you can set any string
-            verify=False  # If using self-signed certificates, you may disable SSL verification
+            region_name="us-east-1",  # Typically not relevant for MinIO
+            verify=False  # Disable SSL verification if self-signed
         )
         self.bucket_name = os.environ.get("MINIO_BUCKET", "my-minio-bucket")
 
     def save_file_with_metadata(self, file_content: bytes, file_path: str, metadata: dict):
+        # Upload file
         self.minio_client.put_object(
             Bucket=self.bucket_name,
             Key=file_path,
@@ -94,6 +121,7 @@ class MinioDataLake(DataLake):
             Metadata={k: str(v) for k, v in metadata.items() if isinstance(v, (str, int, float))}
         )
 
+        # Upload metadata
         meta_path = file_path + ".metadata.json"
         self.minio_client.put_object(
             Bucket=self.bucket_name,
@@ -106,6 +134,9 @@ class MinioDataLake(DataLake):
         return resp['Body'].read()
 
 
+###############################################################################
+# Azure Blob Datalake
+###############################################################################
 class AzureBlobDataLake(DataLake):
     def __init__(self):
         self.connection_string = os.environ.get("AZURE_BLOB_CONNECTION_STRING")
@@ -118,6 +149,7 @@ class AzureBlobDataLake(DataLake):
             self.container_client.create_container()
 
     def save_file_with_metadata(self, file_content: bytes, file_path: str, metadata: dict):
+        # Upload main file
         blob_client = self.container_client.get_blob_client(blob=file_path)
         blob_client.upload_blob(
             file_content,
@@ -126,7 +158,7 @@ class AzureBlobDataLake(DataLake):
             content_settings=ContentSettings(content_type="application/octet-stream")
         )
 
-        # Save metadata as a separate file
+        # Upload metadata as separate .metadata.json
         meta_path = file_path + ".metadata.json"
         meta_blob_client = self.container_client.get_blob_client(blob=meta_path)
         meta_blob_client.upload_blob(
@@ -140,10 +172,14 @@ class AzureBlobDataLake(DataLake):
         downloader = blob_client.download_blob()
         return downloader.readall()
 
+
+###############################################################################
+# Data Lake Factory
+###############################################################################
 def get_datalake(datalake_type: str) -> DataLake:
     """
-    Factory method to get the appropriate datalake implementation.
-    datalake_type could be 's3', 'azureblob', 'local', 'minio' etc.
+    Returns the appropriate datalake implementation based on datalake_type.
+    Options: 's3', 'azureblob', 'local', 'minio'.
     """
     if datalake_type == 's3':
         return S3DataLake()
@@ -157,6 +193,9 @@ def get_datalake(datalake_type: str) -> DataLake:
         raise ValueError(f"Unsupported datalake_type: {datalake_type}")
 
 
+###############################################################################
+# Google Drive Integration
+###############################################################################
 class GoogleDriveIntegration:
     def __init__(self):
         self.client_id = os.environ.get("GOOGLE_CLIENT_ID")
@@ -181,7 +220,10 @@ class GoogleDriveIntegration:
 
     def list_files(self, folder_id: str = None) -> List[Dict]:
         query = f"'{folder_id}' in parents" if folder_id else None
-        results = self.service.files().list(q=query, fields="files(id, name, mimeType, createdTime, owners)").execute()
+        results = self.service.files().list(
+            q=query,
+            fields="files(id, name, mimeType, createdTime, owners)"
+        ).execute()
         return results.get('files', [])
 
     def download_file(self, file_id: str) -> bytes:
@@ -196,6 +238,9 @@ class GoogleDriveIntegration:
         return fh.read()
 
 
+###############################################################################
+# OneDrive Integration
+###############################################################################
 class OneDriveIntegration:
     def __init__(self):
         self.client_id = os.environ.get("MS_CLIENT_ID")
@@ -241,6 +286,9 @@ class OneDriveIntegration:
         return file_resp.content
 
 
+###############################################################################
+# SharePoint Integration
+###############################################################################
 class SharePointIntegration:
     def __init__(self):
         self.client_id = os.environ.get("MS_CLIENT_ID")
@@ -286,8 +334,12 @@ class SharePointIntegration:
         return file_resp.content
 
 
+###############################################################################
+# S3Integration for Migrating from Another S3 Bucket
+###############################################################################
 class S3Integration:
     def __init__(self):
+        # Another S3 client used for migrating from an external S3 bucket
         self.s3 = boto3.client(
             's3',
             aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
@@ -308,9 +360,13 @@ class S3Integration:
         return file_obj.read()
 
 
+###############################################################################
+# Data Integration Method
+###############################################################################
 def integrate_data_into_datalake(provider: str, datalake_type: str, **kwargs):
     """
-    Retrieve files from the given provider and store their content & metadata into the chosen data lake.
+    Download files from an external provider (Google Drive, OneDrive, SharePoint, or another S3),
+    then store them in the chosen local/remote data lake (e.g., minio, s3, azureblob, local).
     """
     datalake = get_datalake(datalake_type)
     now_str = datetime.datetime.utcnow().isoformat()
@@ -330,7 +386,8 @@ def integrate_data_into_datalake(provider: str, datalake_type: str, **kwargs):
                 "authors": [o.get('displayName') for o in f.get('owners', [])],
                 "imported_at": now_str
             }
-            path = f"google_drive/{f.get('name', file_id)}"
+            path_name = f.get('name', file_id)
+            path = f"google_drive/{path_name}"
             datalake.save_file_with_metadata(content, path, metadata)
 
     elif provider == "onedrive":
@@ -351,7 +408,8 @@ def integrate_data_into_datalake(provider: str, datalake_type: str, **kwargs):
                     "lastModifiedDateTime": f.get("lastModifiedDateTime"),
                     "imported_at": now_str
                 }
-                path = f"onedrive/{f.get('name', item_id)}"
+                path_name = f.get('name', item_id)
+                path = f"onedrive/{path_name}"
                 datalake.save_file_with_metadata(content, path, metadata)
 
     elif provider == "sharepoint":
@@ -374,10 +432,12 @@ def integrate_data_into_datalake(provider: str, datalake_type: str, **kwargs):
                     "lastModifiedDateTime": f.get("lastModifiedDateTime"),
                     "imported_at": now_str
                 }
-                path = f"sharepoint/{f.get('name', item_id)}"
+                path_name = f.get('name', item_id)
+                path = f"sharepoint/{path_name}"
                 datalake.save_file_with_metadata(content, path, metadata)
 
     elif provider == "s3":
+        # Migrate from an external AWS S3 bucket to your chosen data lake
         s3i = S3Integration()
         bucket_name = kwargs.get("bucket_name")
         prefix = kwargs.get("prefix", "")
@@ -391,7 +451,10 @@ def integrate_data_into_datalake(provider: str, datalake_type: str, **kwargs):
                 "object_key": key,
                 "imported_at": now_str
             }
-            path = f"aws_s3/{key.replace('/', '_')}"
+            # Replace / with _ to avoid subfolder issues
+            safe_key = key.replace('/', '_')
+            path = f"aws_s3/{safe_key}"
             datalake.save_file_with_metadata(content, path, metadata)
+
     else:
         raise ValueError("Unsupported provider")

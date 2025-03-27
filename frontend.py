@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 # ------------------------------------------------------------------------
 # IMPORTANT: import your factory method from the storage_integration script
 # ------------------------------------------------------------------------
-from storage_integrations import integrate_data_into_datalake
+from storage_integrations import integrate_data_into_datalake, get_datalake
 
 # Import the improved backend module (with multi-vector embeddings, etc.)
 import backend
@@ -78,12 +78,16 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 # Slack Bot configuration
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
-
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
 # Locks for concurrency
 model_lock = threading.Lock()
 llm_lock = threading.Lock()
+
+# ------------------------------------------------------------------------
+# Make MinIO the default, but allow changing via env or form field
+# ------------------------------------------------------------------------
+DEFAULT_DATALAKE = os.environ.get("DATALAKE_TYPE", "minio")
 
 # Initialize backend (Milvus, Neo4j, Models)
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j-roles:7687")  # Change from localhost
@@ -330,12 +334,10 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
     3) Merge results (by average or max of similarity)
     4) Return top_k doc_ids
     """
-    # Step 1: embed query in both models
     with model_lock:
         sem_emb = backend.semantic_embedding_model.encode([query], show_progress_bar=False)[0].astype(np.float32)
         lex_emb = backend.lexical_embedding_model.encode([query], show_progress_bar=False)[0].astype(np.float32)
 
-    # Step 2: do Milvus searches
     sem_search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
     lex_search_params = {"metric_type": "COSINE", "params": {"ef": 64}}
 
@@ -355,9 +357,7 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
         output_fields=["document_id"]
     )[0]
 
-    # Step 3: unify and rank
     score_map = {}
-
     for hit in sem_results:
         doc_id = hit.entity.get("document_id")
         score = hit.score
@@ -382,10 +382,6 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
     return top_doc_ids
 
 def generate_cypher_query(refined_query: str) -> str:
-    """
-    Use LLM to generate a possible Cypher query to find relevant docs in the graph
-    ...
-    """
     prompt = f"""
     You are a Cypher query generator. The user (in the knowledge base) asked a refined query:
     '{refined_query}'
@@ -403,10 +399,6 @@ def generate_cypher_query(refined_query: str) -> str:
     return possible_cypher
 
 def run_cypher_query(query_text: str, top_k: int = 5) -> list:
-    """
-    Attempts to run a given Cypher query, expecting it to return a list of doc_ids
-    from Document nodes. We'll parse them out.
-    """
     doc_ids = []
     with backend.driver.session() as session:
         try:
@@ -424,9 +416,6 @@ def run_cypher_query(query_text: str, top_k: int = 5) -> list:
     return doc_ids[:top_k]
 
 def retrieve_docs_from_neo4j(doc_ids: list) -> list:
-    """
-    Given a list of doc_ids, fetch their content and metadata from Neo4j.
-    """
     if not doc_ids:
         return []
 
@@ -449,11 +438,6 @@ def retrieve_docs_from_neo4j(doc_ids: list) -> list:
     return documents
 
 def get_hybrid_plus_cypher_docs(refined_query: str, top_k: int = 5, use_cypher_expansion: bool = True) -> list:
-    """
-    1. Multi-vector search in Milvus
-    2. (Optional) Generate a Cypher query to find relevant docs in Neo4j
-    3. Merge doc_ids, retrieve content from Neo4j
-    """
     doc_ids_hybrid = hybrid_search(refined_query, top_k=top_k)
 
     doc_ids_cypher = []
@@ -505,7 +489,7 @@ def get_storage_settings():
         return json.load(f)
 
 ################################################################################
-# Existing Endpoints
+# Existing Endpoints (unchanged except for /documents)
 ################################################################################
 
 @app.get("/chats", response_model=dict)
@@ -620,46 +604,106 @@ def assign_user_to_workspace(
         cursor.close()
         connection.close()
 
+# ----------------------------------------------------------------------------
+# UPDATED /documents ENDPOINT:
+#  - Stores in MinIO (default) or S3 if "storage_choice" is provided
+#  - Accepts optional workspace_id
+#  - Auto-embeds using backend logic
+# ----------------------------------------------------------------------------
 @app.post("/documents")
 def upload_document(
     file: UploadFile = File(...),
     scope: str = Form(...),
     chat_id: Optional[str] = Form(None),
+    workspace_id: Optional[int] = Form(None),
+    storage_choice: Optional[str] = Form(None),
     current_user=Depends(role_required(["user", "admin", "superadmin"]))
 ):
+    """
+    Uploads a file to the chosen data lake (MinIO default).
+    If scope="workspace", requires admin/superadmin role.
+    Then auto-embeds by extracting text and calling the backend logic.
+    """
     if scope not in ["chat", "profile", "workspace", "system"]:
         raise HTTPException(status_code=400, detail="Invalid scope")
 
     if scope == "chat" and not chat_id:
         raise HTTPException(status_code=400, detail="chat_id is required for chat scope")
 
+    # For workspace scope, enforce admin or superadmin
     if scope == "workspace" and current_user["role"] not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Admins and Superadmins only")
+        raise HTTPException(status_code=403, detail="Admins and Superadmins only for workspace scope")
+    if scope == "workspace" and workspace_id is None:
+        raise HTTPException(status_code=400, detail="workspace_id is required for workspace scope")
+
+    # For system scope, enforce superadmin
     if scope == "system" and current_user["role"] != "superadmin":
         raise HTTPException(status_code=403, detail="Superadmins only")
 
-    file_content = file.file.read().decode("utf-8")
-    doc_id = hashlib.sha256(file_content.encode()).hexdigest()
-    metadata = {"filename": file.filename, "scope": scope}
+    # Decide data lake (minio by default)
+    chosen_datalake = storage_choice if storage_choice else DEFAULT_DATALAKE
+    dlake = get_datalake(chosen_datalake)
 
-    # Store doc in Neo4j (omitting workspace logic for brevity)
-    with backend.driver.session() as session:
-        session.run(
-            """
-            CREATE (d:Document {
-                doc_id: $doc_id,
-                content: $content,
-                metadata: $metadata,
-                is_global: false,
-                workspace_id: null
-            })
-            """,
-            doc_id=doc_id,
-            content=file_content,
-            metadata=json.dumps(metadata)
-        )
+    # 1) Read file bytes
+    file_bytes = file.file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="File is empty or unreadable.")
 
-    return {"message": f"Document uploaded successfully with scope {scope}"}
+    filename = file.filename
+    # Use a stable object path (or generate a unique ID, up to you)
+    object_path = f"{scope}/{filename}"
+
+    # 2) Save to data lake with metadata
+    metadata = {
+        "filename": filename,
+        "scope": scope,
+        "uploaded_by": current_user["user_id"],
+        "workspace_id": workspace_id,
+        "uploaded_at": datetime.utcnow().isoformat()
+    }
+    dlake.save_file_with_metadata(file_bytes, object_path, metadata)
+
+    # 3) Convert bytes to text, chunk & embed
+    #    We'll do it by writing to a temp file + reading with backend
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_filepath = os.path.join(tmpdir, filename)
+        with open(temp_filepath, "wb") as f_out:
+            f_out.write(file_bytes)
+
+        content = backend.read_file_content(temp_filepath)
+        if not content:
+            raise HTTPException(status_code=400, detail="Could not parse text from the file.")
+
+        # Split & embed
+        chunks = backend.chunk_text_with_langchain(content, chunk_size=1000, chunk_overlap=200)
+        file_level_meta = {
+            "filename": filename,
+            "scope": scope,
+            "workspace_id": workspace_id,
+            "size": len(file_bytes),
+            "word_count": len(content.split())
+        }
+
+        doc_ids = []
+        sem_embeddings = []
+
+        for ctext in chunks:
+            doc_id = backend.process_chunk(ctext, file_level_meta)
+            doc_ids.append(doc_id)
+
+            # For doc-doc similarity
+            sem_emb = backend.semantic_embedding_model.encode([ctext], show_progress_bar=False)[0]
+            sem_embeddings.append(sem_emb)
+
+        # Link similar docs
+        backend.compute_batch_similarities(doc_ids, sem_embeddings, threshold=0.7)
+
+    return {
+        "message": f"Document uploaded to {chosen_datalake} with scope '{scope}'.",
+        "object_path": object_path,
+        "workspace_id": workspace_id
+    }
 
 @app.post("/chat", response_model=ChatResponse)
 def generate_response(
@@ -982,21 +1026,14 @@ def local_datalake_upload_file(
     Endpoint to upload a file from the user's computer into the local datalake,
     tag it with is_global or workspace_id, and embed it using backend's logic.
     """
-
-    # 1) Read file into bytes
     filename = file.filename
     file_bytes = file.file.read()
     if not file_bytes:
         raise HTTPException(status_code=400, detail="File is empty or unreadable.")
 
-    # 2) Store in local datalake with metadata (is_global, workspace_id, etc.)
-    from storage_integrations import get_datalake
     local_dlake = get_datalake("local")  # specifically want local
-
-    # We'll store uploaded files in "uploaded/" subfolder in local datalake
     local_path = f"uploaded/{filename}"
 
-    # Create metadata
     metadata = {
         "filename": filename,
         "uploaded_by": current_user["user_id"],
@@ -1004,26 +1041,19 @@ def local_datalake_upload_file(
         "workspace_id": workspace_id,
         "uploaded_at": datetime.utcnow().isoformat()
     }
-    # Save file + metadata
     local_dlake.save_file_with_metadata(file_bytes, local_path, metadata)
 
-    # 3) Embed it by calling the existing logic in backend
     import tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
         temp_filepath = os.path.join(tmpdir, filename)
-        # Write file bytes to a temporary file so we can reuse backend.read_file_content(...)
         with open(temp_filepath, "wb") as f_out:
             f_out.write(file_bytes)
 
-        # Extract text from the file
         content = backend.read_file_content(temp_filepath)
         if not content:
             raise HTTPException(status_code=400, detail="Could not parse text from the file.")
 
-        # Split into chunks (using your existing chunk function)
         chunks = backend.chunk_text_with_langchain(content, chunk_size=1000, chunk_overlap=200)
-
-        # Create base metadata for the Document nodes
         file_level_meta = {
             "filename": filename,
             "is_global": is_global,
@@ -1032,24 +1062,15 @@ def local_datalake_upload_file(
             "word_count": len(content.split())
         }
 
-        # We'll gather doc_ids + embeddings for doc-doc similarity
         doc_ids = []
         sem_embeddings = []
 
         for ctext in chunks:
-            # This calls the same logic that:
-            #   - Summarizes chunk
-            #   - Creates doc node in Neo4j
-            #   - Possibly does entity extraction
-            #   - Stores embeddings in Milvus
             doc_id = backend.process_chunk(ctext, file_level_meta)
             doc_ids.append(doc_id)
-
-            # For doc-doc similarity, store the semantic embedding
             sem_emb = backend.semantic_embedding_model.encode([ctext], show_progress_bar=False)[0]
             sem_embeddings.append(sem_emb)
 
-        # Finally, link these new chunks to each other if they're similar
         backend.compute_batch_similarities(doc_ids, sem_embeddings, threshold=0.7)
 
     return {
@@ -1133,7 +1154,6 @@ def llm_moderation_check(query: str) -> bool:
     Use the LLM to decide if a query is ALLOWED or DISALLOWED based on a simple inline policy.
     Returns True if allowed, False if disallowed.
     """
-    # A minimal policy prompt:
     policy_prompt = f"""
 System: You are a strict content policy checker. The user input is below.
 If the user is discussing or requesting disallowed topics (like politics), respond EXACTLY 'DISALLOWED'.
@@ -1146,7 +1166,6 @@ User input:
     with llm_lock:
         classification = llm.invoke(policy_prompt).strip().upper()
 
-    # If the LLM says DISALLOWED, we return False. Otherwise True.
     if "DISALLOWED" in classification:
         return False
     return True
@@ -1169,10 +1188,7 @@ rouge_metric = evaluate.load("rouge")
 meteor_metric = evaluate.load("meteor")
 bertscore_metric = evaluate.load("bertscore")
 
-def compute_precision_recall_f1(
-    relevant: set,
-    retrieved: set
-):
+def compute_precision_recall_f1(relevant: set, retrieved: set):
     if not relevant and not retrieved:
         return 1.0, 1.0, 1.0
     tp = len(relevant.intersection(retrieved))
@@ -1243,22 +1259,17 @@ def evaluate_system(request_data: EvaluationRequest):
     For each item, this endpoint:
       1. Refines the query and retrieves documents.
       2. Constructs a prompt and generates a new system answer using the LLM.
-      3. Computes retrieval metrics (using the provided retrieved_docs) and
-         generative (text) metrics comparing the new answer with the ground truth.
-      4. Logs all metrics to TensorBoard and returns the aggregated metrics
-         along with the generated answers.
+      3. Computes retrieval metrics and text metrics,
+         logs them to TensorBoard, and returns aggregated metrics + answers.
     """
     if not TENSORBOARD_AVAILABLE:
         raise HTTPException(status_code=500, detail="TensorBoard not installed or unavailable.")
 
     data = request_data.data
-
-    # Create a TensorBoard SummaryWriter (using a timestamped directory)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = f"runs/evaluation_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
 
-    # Initialize accumulators for retrieval metrics
     sum_precision = 0.0
     sum_recall = 0.0
     sum_f1 = 0.0
@@ -1266,14 +1277,12 @@ def evaluate_system(request_data: EvaluationRequest):
     sum_ndcg = 0.0
     retrieval_count = 0
 
-    # For generative metrics (text evaluation)
     all_predictions = []
     all_references = []
     generated_answers = []
 
-    # Process each evaluation item
     for idx, item in enumerate(data):
-        # --- Retrieval metrics are computed based on provided docs ---
+        # Retrieval metrics
         relevant_docs = set(item.ground_truth_docs)
         retrieved_docs = item.retrieved_docs
         if relevant_docs or retrieved_docs:
@@ -1289,20 +1298,17 @@ def evaluate_system(request_data: EvaluationRequest):
         else:
             p = r = f1 = mrr = ndcg = 1.0
 
-        # Log per-item retrieval metrics
         writer.add_scalar("per_item/precision", p, idx)
         writer.add_scalar("per_item/recall", r, idx)
         writer.add_scalar("per_item/f1", f1, idx)
         writer.add_scalar("per_item/mrr", mrr, idx)
         writer.add_scalar("per_item/ndcg", ndcg, idx)
 
-        # --- Generate a new system answer ---
-        # Assume an empty conversation context for evaluation.
+        # Generate a new system answer
         conversation_so_far = ""
         refined_query = refine_query(item.query, conversation_so_far)
         docs = get_hybrid_plus_cypher_docs(refined_query, top_k=3, use_cypher_expansion=True)
 
-        # Build a context string from the retrieved documents
         context_text = ""
         for doc in docs:
             piece = f"{doc['content']}\n(Source: {doc['filename']})\n\n"
@@ -1312,7 +1318,6 @@ def evaluate_system(request_data: EvaluationRequest):
                 context_text += "... [truncated]"
                 break
 
-        # Construct the prompt using the query and context
         prompt = f"""
         You are a helpful assistant who provides concise, step-by-step solutions.
         Conversation so far: {conversation_so_far}
@@ -1321,21 +1326,17 @@ def evaluate_system(request_data: EvaluationRequest):
         Your concise answer:
         """.strip()
 
-        # Generate the new system answer using your LLM
         with llm_lock:
             generated_answer = llm.invoke(prompt).strip()
         generated_answer = generated_answer.encode('utf-8', errors='replace').decode('utf-8')
 
-        # Fill the evaluation item with the newly generated answer
         item.system_answer = generated_answer
         generated_answers.append(generated_answer)
 
-        # For generative metrics, accumulate ground truth and generated answer
         if item.ground_truth_answer:
             all_references.append(item.ground_truth_answer)
             all_predictions.append(generated_answer)
 
-    # Compute aggregated retrieval metrics
     if retrieval_count > 0:
         avg_precision = sum_precision / retrieval_count
         avg_recall = sum_recall / retrieval_count
@@ -1351,7 +1352,6 @@ def evaluate_system(request_data: EvaluationRequest):
     writer.add_scalar("retrieval/mrr", avg_mrr, 0)
     writer.add_scalar("retrieval/ndcg", avg_ndcg, 0)
 
-    # Compute generative (text) metrics if ground truth answers exist
     if all_predictions and all_references:
         generative_metrics = compute_text_metrics(all_predictions, all_references)
         writer.add_scalar("generative/rouge1_f", generative_metrics["rouge1_f"], 0)
@@ -1419,42 +1419,23 @@ def update_moderation_config(
         json.dump(new_config.dict(), f, ensure_ascii=False, indent=2)
     return {"message": "Moderation config updated successfully."}
 
-
 # ----------------------------------------------------------------------------
 # NEW: API KEY CREATION & LISTING FOR ADMIN/SUPERADMIN
 # ----------------------------------------------------------------------------
 import secrets
 
 class ApiKeyCreateRequest(BaseModel):
-    name: str  # e.g. "Popup Integration" or "Marketing Website"
+    name: str
     is_global: bool = True
-    workspace_id: Optional[int] = None  # if you want to limit usage to a workspace, set this
+    workspace_id: Optional[int] = None
 
 @app.post("/admin/api-keys/generate")
 def generate_api_key(
     req: ApiKeyCreateRequest,
     current_user=Depends(role_required(["admin", "superadmin"]))
 ):
-    """
-    Generates a new random API key for external usage, optionally tied to a workspace or global.
-    Stores it in 'api_keys' table (which you must create in DB).
-    Returns the raw key_value once (make sure to copy it!).
-    """
-
-    # Make a random hex token
     new_key_value = secrets.token_hex(32)  # e.g. 64-char hex string
 
-    # Insert into a hypothetical 'api_keys' table.
-    # You must create a table in Postgres like:
-    # CREATE TABLE IF NOT EXISTS api_keys (
-    #   id SERIAL PRIMARY KEY,
-    #   name TEXT,
-    #   key_value TEXT UNIQUE,
-    #   is_global BOOLEAN DEFAULT TRUE,
-    #   workspace_id INT,
-    #   created_by INT,
-    #   created_at TIMESTAMP DEFAULT NOW()
-    # );
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
@@ -1480,21 +1461,14 @@ def generate_api_key(
         "api_key_value": new_key_value,
         "is_global": req.is_global,
         "workspace_id": req.workspace_id,
-        "message": "API Key generated successfully. Please copy the api_key_value now, as it won't be shown again."
+        "message": "API Key generated successfully. Please copy it now, as it won't be shown again."
     }
 
 @app.get("/admin/api-keys")
 def list_api_keys(current_user=Depends(role_required(["admin", "superadmin"]))):
-    """
-    Lists existing API keys from the 'api_keys' table.
-    - If role == 'superadmin', show all keys.
-    - If role == 'admin', show only keys created_by this user.
-    For security reasons, consider hiding the raw key_value in production.
-    """
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        # If superadmin, see all keys
         if current_user["role"] == "superadmin":
             query = """
                 SELECT id, name, key_value, is_global, workspace_id, created_by, created_at
@@ -1503,7 +1477,6 @@ def list_api_keys(current_user=Depends(role_required(["admin", "superadmin"]))):
             """
             cursor.execute(query)
         else:
-            # Admin: see only your own keys
             query = """
                 SELECT id, name, key_value, is_global, workspace_id, created_by, created_at
                 FROM api_keys
@@ -1530,6 +1503,7 @@ def list_api_keys(current_user=Depends(role_required(["admin", "superadmin"]))):
     finally:
         cursor.close()
         connection.close()
+
 from fastapi import Header
 
 @app.post("/external-chat", response_model=ChatResponse)
@@ -1543,12 +1517,9 @@ def external_chat(
     2) If valid, we pass a 'fake' user object with user_id=0 into the existing /chat function.
     3) The /chat logic is reused exactly.
     """
-
-    # 1) Check if x_api_key is present
     if not x_api_key:
         raise HTTPException(status_code=403, detail="Missing X-Api-Key header.")
 
-    # 2) Validate the API key from your database
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
@@ -1561,9 +1532,7 @@ def external_chat(
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=403, detail="Invalid or unknown API key.")
-
-        # If you want to enforce is_global/workspace here, do so
-        # e.g. is_global = row[1], workspace_id = row[2]
+        # If you want to enforce is_global/workspace usage, do so here
     except Exception as e:
         cursor.close()
         connection.close()
@@ -1572,13 +1541,7 @@ def external_chat(
         cursor.close()
         connection.close()
 
-    # 3) Create a "fake" user dict with user_id=0, so the /chat logic sees "someone"
-    #    You can pick any role that passes your internal checks. Typically "admin" or "superadmin."
     fake_user = {"user_id": 0, "role": "user", "workspace_id": None}
-
-    # 4) Reuse the existing generate_response(...) function
-    #    because it takes (request, current_user=...).
-    #    The "Depends(get_current_user_with_role)" will be skipped when we call it directly.
     return generate_response(request, fake_user)
 
 @app.delete("/admin/api-keys/{id}/revoke")
@@ -1586,15 +1549,9 @@ def revoke_api_key(
     id: int,
     current_user=Depends(role_required(["admin", "superadmin"]))
 ):
-    """
-    Revokes (deletes) the API key with the given ID from the api_keys table.
-    - If role == 'superadmin', can revoke any key.
-    - If role == 'admin', can only revoke keys they created themselves.
-    """
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        # 1) Check if the key exists
         cursor.execute("""
             SELECT id, created_by
             FROM api_keys
@@ -1605,12 +1562,9 @@ def revoke_api_key(
             raise HTTPException(status_code=404, detail="API key not found")
 
         key_id, created_by = row
-
-        # 2) If the current user is 'admin', ensure they own this key
         if current_user["role"] == "admin" and created_by != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="You do not have permission to revoke this key")
 
-        # 3) Perform the delete
         cursor.execute("DELETE FROM api_keys WHERE id = %s", (key_id,))
         connection.commit()
 

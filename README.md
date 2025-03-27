@@ -8,7 +8,7 @@ Uvicorn server with backend and Retrieval-Augmented Generation logic. Other serv
 - **Disk Space:** minimal 20 GB 
 - Ubuntu 24.0.2 LTS (tested on this version) or Windows 11 (tested on this version)
 
-## Startup
+## Install
 
 ### Docker compose + separate uvicorn server 
 #### Requirements:

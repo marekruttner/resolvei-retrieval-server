@@ -2,20 +2,16 @@ name: Build & Push Resolvei Docker Image
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "development" ]
   workflow_dispatch:
 
-###############################################
-# Add permissions to allow pushing to GHCR
-###############################################
 permissions:
-  contents: read     # read code
-  packages: write    # crucial for pushing to GHCR
+  contents: read
+  packages: write
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-
     steps:
       # 1) Check out the code
       - name: Check out code
@@ -37,18 +33,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 5) Build and push the Docker image
-      - name: Build and push Resolvei image
+      # 5) Build and push the Docker image for main branch
+      - name: Build and push Resolvei image (main)
+        if: github.ref_name == 'main'
         uses: docker/build-push-action@v4
         with:
-          # Adjust context if Dockerfile is in a subfolder
           context: .
-          # If Dockerfile is not named "Dockerfile", specify:
-          #   dockerfile: <path/to/yourDockerfile>
-
           platforms: linux/amd64
           push: true
+          tags: ghcr.io/${{ github.repository }}:latest
 
-          tags: |
-            ghcr.io/${{ github.repository }}:resolvei-latest
-
+      # 6) Build and push the Docker image for development branch
+      - name: Build and push Resolvei image (development)
+        if: github.ref_name == 'development'
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository }}:development
