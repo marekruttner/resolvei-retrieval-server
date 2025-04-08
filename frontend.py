@@ -19,6 +19,8 @@ from slack_sdk.errors import SlackApiError
 import hmac
 import threading
 from dotenv import load_dotenv
+import re
+from browser_use import use_browser
 
 # ------------------------------------------------------------------------
 # IMPORTANT: import your factory method from the storage_integration script
@@ -61,17 +63,17 @@ load_dotenv()
 
 # PostgreSQL connection
 DB_CONFIG = {
-    "dbname": os.getenv("DB_NAME"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "host": os.getenv("DB_HOST"),
-    "port": os.getenv("DB_PORT"),
+    "host": os.getenv("DB_HOST", "localhost"),
+    "dbname": os.getenv("DB_NAME", "chatdb"),
+    "user": os.getenv("DB_USER", "admin"),
+    "password": os.getenv("DB_PASSWORD", "adminadmin"),
+    "port": os.getenv("DB_PORT", "5432"),
 }
 
 # JWT Configuration
-SECRET_KEY = os.getenv("SECRET_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", "your_super_secret_key_here")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 180
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
@@ -86,11 +88,11 @@ model_lock = threading.Lock()
 llm_lock = threading.Lock()
 
 # Initialize backend (Milvus, Neo4j, Models)
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j-roles:7687")  # Change from localhost
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")  # Change from localhost
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "testtest")
 
-MILVUS_HOST = os.getenv("MILVUS_HOST", "standalone")  # Change from localhost
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")  # Change from localhost
 MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 
 backend.initialize_all(
@@ -383,23 +385,28 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
 
 def generate_cypher_query(refined_query: str) -> str:
     """
-    Use LLM to generate a possible Cypher query to find relevant docs in the graph
-    ...
+    Use LLM to generate a possible Cypher query...
     """
     prompt = f"""
-    You are a Cypher query generator. The user (in the knowledge base) asked a refined query:
-    '{refined_query}'
+    You are a Cypher query generator. The user asked: '{refined_query}'
 
-    We have a Neo4j graph with :Document, :Topic, :Entity, and relationships like:
-    (Document)-[:HAS_TOPIC]->(Topic), (Document)-[:MENTIONS]->(Entity),
-    (Document)-[:RELATED {{type: 'SIMILAR_TO', ...}}]->(Document).
+    We have a Neo4j graph with :Document, :Topic, :Entity...
 
     Generate a short Cypher query that tries to find Document nodes relevant to the user query.
-    Only output the Cypher.
-    """.strip()
+    Only output the raw Cypher itself, without code fences or extra text.
+    """
 
     with llm_lock:
         possible_cypher = llm.invoke(prompt).strip()
+
+    # -- POST-PROCESSING TO REMOVE FENCED CODE BLOCKS --
+    # 1) Remove any triple backticks or inline fences
+    possible_cypher = re.sub(r"```(\w+)?", "", possible_cypher)
+    possible_cypher = re.sub(r"```", "", possible_cypher)
+
+    # 2) Strip leading/trailing whitespace
+    possible_cypher = possible_cypher.strip()
+
     return possible_cypher
 
 def run_cypher_query(query_text: str, top_k: int = 5) -> list:
@@ -503,6 +510,37 @@ def get_storage_settings():
         raise HTTPException(status_code=500, detail="Storage configuration not found.")
     with open(config_path, "r") as f:
         return json.load(f)
+
+def browser_use_search(query: str, max_chars: int = 1000) -> str:
+    """
+    Uses browser-use to search the web and return extracted info.
+    """
+    try:
+        result = use_browser(query, max_chars=max_chars)
+        return result['output']
+    except Exception as e:
+        print(f"[BrowserUse Error]: {e}")
+        return "Sorry, I couldn't retrieve the information from the web."
+
+def should_use_browser(query: str) -> bool:
+    """
+    Uses the LLM to judge if the browser should be used.
+    """
+    judger_prompt = f"""
+System: You are a smart content router.
+Decide whether the user's query should be answered using a web browser.
+
+If it involves current events, recent tech, specific product models, trends, or up-to-date info (e.g. phone releases, pricing), respond EXACTLY with "YES".
+If it's general knowledge or doesn't need real-time info, respond EXACTLY with "NO".
+
+User query: {query}
+Should use browser:
+    """.strip()
+
+    with llm_lock:
+        result = llm.invoke(judger_prompt).strip().upper()
+
+    return result == "YES"
 
 ################################################################################
 # Existing Endpoints
@@ -754,19 +792,32 @@ def generate_response(
     if len(truncated_conversation) > MAX_CONVERSATION_CHARS:
         truncated_conversation = truncated_conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated]"
 
+    # 5) Use browser
+    browser_context = ""
+    if should_use_browser(refined_query):
+        browser_context = browser_use_search(refined_query)
+        print(f"[Browser Context]: {browser_context}")
+
     # 5) Construct prompt
     prompt = f"""
-        You are a helpful assistant who provides concise, step-by-step solutions.
-        Conversation so far:
-        {truncated_conversation}
+    You are an expert helpdesk support assistant who delivers clear, concise, and step-by-step solutions. 
+    Your goal is to ensure the user receives an accurate and actionable answer by thoroughly analyzing all provided context. 
+    Leverage the conversation history, extract key insights from the relevant documents, and consider browser search results 
+    as needed. Focus on addressing the user's query with clarity and precision.
 
-        Relevant context:
-        {context_text}
+    Conversation History:
+    {truncated_conversation}
 
-        Question:
-        {request.query}
+    Relevant Documents (Review these carefully and extract the most pertinent details):
+    {context_text}
 
-        Your concise answer:
+    Browser Search Results (if available):
+    {browser_context}
+
+    User's Query:
+    {request.query}
+
+    Provide your concise, step-by-step answer below:
     """.strip()
 
     # 6) LLM response
