@@ -3,7 +3,10 @@ import hashlib
 import json
 import psycopg2
 import numpy as np
-from langchain_community.llms import Ollama
+
+# Use the official langchain-ollama wrapper
+from langchain_ollama import ChatOllama
+
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, Form, Request, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
@@ -11,6 +14,7 @@ from fastapi.responses import JSONResponse
 from fastapi.background import BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional, Union, List
+from neo4j.exceptions import CypherSyntaxError
 import uuid
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
@@ -19,8 +23,12 @@ from slack_sdk.errors import SlackApiError
 import hmac
 import threading
 from dotenv import load_dotenv
+
 import re
-from browser_use import use_browser
+from agents.browser_agent import (
+    run_browser_task_sync,
+    should_use_browser
+)
 
 # ------------------------------------------------------------------------
 # IMPORTANT: import your factory method from the storage_integration script
@@ -33,6 +41,7 @@ import backend
 # For summarizing long conversations (optional huggingface approach)
 try:
     from transformers import pipeline
+
     conversation_summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
 except:
     conversation_summarizer = None
@@ -44,6 +53,7 @@ import math
 # TensorBoard
 try:
     from torch.utils.tensorboard import SummaryWriter
+
     TENSORBOARD_AVAILABLE = True
 except ImportError:
     TENSORBOARD_AVAILABLE = False
@@ -88,11 +98,11 @@ model_lock = threading.Lock()
 llm_lock = threading.Lock()
 
 # Initialize backend (Milvus, Neo4j, Models)
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")  # Change from localhost
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "testtest")
 
-MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")  # Change from localhost
+MILVUS_HOST = os.getenv("MILVUS_HOST", "localhost")
 MILVUS_PORT = int(os.getenv("MILVUS_PORT", "19530"))
 
 backend.initialize_all(
@@ -103,8 +113,8 @@ backend.initialize_all(
     milvus_port=MILVUS_PORT
 )
 
-# Initialize LLM (you can choose any model in Ollama)
-llm = Ollama(model="phi4:latest")
+# Initialize LLM (now using ChatOllama from langchain-ollama)
+llm = ChatOllama(model="phi4:latest")
 
 ################################################################################
 # Configurable Constants
@@ -116,6 +126,7 @@ MAX_CONTEXT_CHARS = 3000
 # If conversation grows beyond this length, we do an automatic summary
 CONVERSATION_SUMMARY_TRIGGER = 4000
 
+
 ################################################################################
 # Pydantic Models
 ################################################################################
@@ -124,36 +135,45 @@ class UserCredentials(BaseModel):
     username: str
     password: str
 
+
 class QueryRequest(BaseModel):
     query: str
     new_chat: Optional[bool] = True
     chat_id: Optional[str] = None
 
+
 class RegistrationResponse(BaseModel):
     message: str
+
 
 class LoginResponse(BaseModel):
     access_token: str
     message: str
+
 
 class ChatResponse(BaseModel):
     response: str
     sources: Optional[str]
     chat_id: Optional[str]
 
+
 class UpdateRoleRequest(BaseModel):
     username: str
     new_role: str
 
+
 class CreateWorkspaceRequest(BaseModel):
     name: str
+
 
 class AssignUserRequest(BaseModel):
     user_id: int
 
+
 class StorageConfig(BaseModel):
     datalake_type: str
     config: dict
+
 
 ################################################################################
 # Auth / Helpers
@@ -173,6 +193,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         return int(user_id)
     except JWTError:
         raise credentials_exception
+
 
 async def get_current_user_with_role(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -199,12 +220,14 @@ async def get_current_user_with_role(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
+
 def create_access_token(data: dict, expires_delta: Union[timedelta, None] = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
 
 def save_conversation(user_id, chat_id, query, response):
     """
@@ -231,12 +254,15 @@ def save_conversation(user_id, chat_id, query, response):
         cursor.close()
         connection.close()
 
+
 def role_required(required_roles: list):
     def decorator(current_user=Depends(get_current_user_with_role)):
         if current_user["role"] not in required_roles:
             raise HTTPException(status_code=403, detail="Not enough permissions")
         return current_user
+
     return decorator
+
 
 ################################################################################
 # Query Refinement & Summaries
@@ -264,6 +290,7 @@ def refine_query(original_query: str, conversation_context: str) -> str:
         refined_query = llm.invoke(prompt_for_refinement).strip()
     return refined_query
 
+
 def summarize_conversation(conversation_text: str) -> str:
     """
     Summarizes the conversation if conversation_summarizer is available;
@@ -280,6 +307,7 @@ def summarize_conversation(conversation_text: str) -> str:
     # fallback naive approach
     truncated = conversation_text[:500] + "..."
     return f"Summary of conversation: {truncated}"
+
 
 def maybe_summarize_long_conversation(user_id: int, chat_id: str):
     """
@@ -319,6 +347,7 @@ def maybe_summarize_long_conversation(user_id: int, chat_id: str):
     finally:
         cursor.close()
         connection.close()
+
 
 ################################################################################
 # Multi-Vector + Graph Retrieval
@@ -383,31 +412,87 @@ def hybrid_search(query: str, top_k: int = 5) -> list:
     top_doc_ids = [t[0] for t in doc_id_scores[:top_k]]
     return top_doc_ids
 
-def generate_cypher_query(refined_query: str) -> str:
+
+from neo4j.exceptions import CypherSyntaxError
+
+
+def validate_cypher(query: str) -> bool:
     """
-    Use LLM to generate a possible Cypher query...
+    Quickly checks if the Cypher query is valid by running EXPLAIN in Neo4j.
+    Returns True if valid, False otherwise.
+    """
+    with backend.driver.session() as session:
+        try:
+            session.run("EXPLAIN " + query)
+            return True
+        except CypherSyntaxError:
+            return False
+
+
+def generate_cypher_query(refined_query: str, max_retries: int = 2) -> str:
+    """
+    Use LLM to generate a possible Cypher query relevant to `refined_query`,
+    post-process it, and validate it. If it's invalid, either retry or
+    fall back to a default query.
     """
     prompt = f"""
-    You are a Cypher query generator. The user asked: '{refined_query}'
+        You are a Cypher query generator. The user asked: "{refined_query}"
 
-    We have a Neo4j graph with :Document, :Topic, :Entity...
+        We have a Neo4j graph with :Document, which has properties:
+         - d.title (string)
+         - d.content (string)
+         - d.relevance (float)
 
-    Generate a short Cypher query that tries to find Document nodes relevant to the user query.
-    Only output the raw Cypher itself, without code fences or extra text.
-    """
+        Rules to follow:
+        1. Always use a MATCH on (d:Document).
+        2. For substring checks, use either:
+           d.content CONTAINS 'keyword'
+           d.title CONTAINS 'keyword'
+           or a regex like d.content =~ '.*keyword.*'
+        3. If you ORDER BY something, do it before RETURN, e.g.:
+           MATCH (d:Document)
+           WHERE ...
+           WITH d
+           ORDER BY d.relevance DESC
+           LIMIT 10
+           RETURN d
+        4. Return doc_id if needed: RETURN d.doc_id AS doc_id
+        5. ONLY output the raw Cypher, with no code fences or extra text.
 
-    with llm_lock:
-        possible_cypher = llm.invoke(prompt).strip()
+        User query: "{refined_query}"
+        Generate a single short, valid Cypher query now:
+    """.strip()
 
-    # -- POST-PROCESSING TO REMOVE FENCED CODE BLOCKS --
-    # 1) Remove any triple backticks or inline fences
-    possible_cypher = re.sub(r"```(\w+)?", "", possible_cypher)
-    possible_cypher = re.sub(r"```", "", possible_cypher)
+    for attempt in range(max_retries + 1):
+        with llm_lock:
+            possible_cypher = llm.invoke(prompt).strip()
 
-    # 2) Strip leading/trailing whitespace
-    possible_cypher = possible_cypher.strip()
+        # Remove code fences
+        possible_cypher = re.sub(r"```(\w+)?", "", possible_cypher)
+        possible_cypher = possible_cypher.replace("```", "")
 
-    return possible_cypher
+        # Example fix for "CONTAINS(d.content, 'X')"
+        possible_cypher = re.sub(
+            r"CONTAINS\s*\(\s*d\.content\s*,\s*(['\"])(.*?)\1\s*\)",
+            r"d.content CONTAINS '\2'",
+            possible_cypher
+        )
+
+        possible_cypher = possible_cypher.strip()
+
+        # Validate
+        if validate_cypher(possible_cypher):
+            return possible_cypher
+        else:
+            prompt += "\nYour previous query was invalid. Please correct syntax."
+
+    fallback = """
+MATCH (d:Document)
+RETURN d
+LIMIT 5
+""".strip()
+    return fallback
+
 
 def run_cypher_query(query_text: str, top_k: int = 5) -> list:
     """
@@ -430,13 +515,13 @@ def run_cypher_query(query_text: str, top_k: int = 5) -> list:
     doc_ids = list(set(doc_ids))
     return doc_ids[:top_k]
 
+
 def retrieve_docs_from_neo4j(doc_ids: list) -> list:
     """
     Given a list of doc_ids, fetch their content and metadata from Neo4j.
     """
     if not doc_ids:
         return []
-
     with backend.driver.session() as session:
         result = session.run(
             """
@@ -455,6 +540,7 @@ def retrieve_docs_from_neo4j(doc_ids: list) -> list:
             })
     return documents
 
+
 def get_hybrid_plus_cypher_docs(refined_query: str, top_k: int = 5, use_cypher_expansion: bool = True) -> list:
     """
     1. Multi-vector search in Milvus
@@ -472,13 +558,14 @@ def get_hybrid_plus_cypher_docs(refined_query: str, top_k: int = 5, use_cypher_e
     docs = retrieve_docs_from_neo4j(all_ids)
     return docs
 
+
 ################################################################################
 # Slack Helpers
 ################################################################################
 
 async def verify_slack_signature(request: Request):
     timestamp = request.headers.get("X-Slack-Request-Timestamp")
-    if abs(int(timestamp) - int(datetime.now().timestamp()) ) > 60 * 5:
+    if abs(int(timestamp) - int(datetime.now().timestamp())) > 60 * 5:
         return False
 
     request_body = await request.body()
@@ -489,6 +576,7 @@ async def verify_slack_signature(request: Request):
 
     slack_signature = request.headers.get("X-Slack-Signature")
     return hmac.compare_digest(computed_signature, slack_signature)
+
 
 async def process_slack_command(user_query: str, channel_id: str):
     try:
@@ -504,6 +592,7 @@ async def process_slack_command(user_query: str, channel_id: str):
             text="Sorry, something went wrong while processing your request."
         )
 
+
 def get_storage_settings():
     config_path = "storage_config.json"
     if not os.path.exists(config_path):
@@ -511,36 +600,6 @@ def get_storage_settings():
     with open(config_path, "r") as f:
         return json.load(f)
 
-def browser_use_search(query: str, max_chars: int = 1000) -> str:
-    """
-    Uses browser-use to search the web and return extracted info.
-    """
-    try:
-        result = use_browser(query, max_chars=max_chars)
-        return result['output']
-    except Exception as e:
-        print(f"[BrowserUse Error]: {e}")
-        return "Sorry, I couldn't retrieve the information from the web."
-
-def should_use_browser(query: str) -> bool:
-    """
-    Uses the LLM to judge if the browser should be used.
-    """
-    judger_prompt = f"""
-System: You are a smart content router.
-Decide whether the user's query should be answered using a web browser.
-
-If it involves current events, recent tech, specific product models, trends, or up-to-date info (e.g. phone releases, pricing), respond EXACTLY with "YES".
-If it's general knowledge or doesn't need real-time info, respond EXACTLY with "NO".
-
-User query: {query}
-Should use browser:
-    """.strip()
-
-    with llm_lock:
-        result = llm.invoke(judger_prompt).strip().upper()
-
-    return result == "YES"
 
 ################################################################################
 # Existing Endpoints
@@ -568,6 +627,7 @@ def get_user_chats(current_user_id: int = Depends(get_current_user)):
         cursor.close()
         connection.close()
 
+
 @app.get("/chat/history/{chat_id}", response_model=dict)
 def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_user)):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
@@ -591,6 +651,7 @@ def get_chat_history(chat_id: str, current_user_id: int = Depends(get_current_us
         cursor.close()
         connection.close()
 
+
 @app.post("/register")
 def register_user(username: str = Form(...), password: str = Form(...)):
     hashed_password = hashlib.sha256(password.encode()).hexdigest()
@@ -605,6 +666,7 @@ def register_user(username: str = Form(...), password: str = Form(...)):
     finally:
         cursor.close()
         connection.close()
+
 
 @app.post("/login")
 def login_for_access_token(username: str = Form(...), password: str = Form(...)):
@@ -623,10 +685,11 @@ def login_for_access_token(username: str = Form(...), password: str = Form(...))
         cursor.close()
         connection.close()
 
+
 @app.post("/workspaces")
 def create_workspace(
-    request: CreateWorkspaceRequest,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        request: CreateWorkspaceRequest,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -639,11 +702,12 @@ def create_workspace(
         cursor.close()
         connection.close()
 
+
 @app.post("/workspaces/{workspace_id}/assign-user")
 def assign_user_to_workspace(
-    workspace_id: int,
-    request: AssignUserRequest,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        workspace_id: int,
+        request: AssignUserRequest,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -658,12 +722,13 @@ def assign_user_to_workspace(
         cursor.close()
         connection.close()
 
+
 @app.post("/documents")
 def upload_document(
-    file: UploadFile = File(...),
-    scope: str = Form(...),
-    chat_id: Optional[str] = Form(None),
-    current_user=Depends(role_required(["user", "admin", "superadmin"]))
+        file: UploadFile = File(...),
+        scope: str = Form(...),
+        chat_id: Optional[str] = Form(None),
+        current_user=Depends(role_required(["user", "admin", "superadmin"]))
 ):
     if scope not in ["chat", "profile", "workspace", "system"]:
         raise HTTPException(status_code=400, detail="Invalid scope")
@@ -699,10 +764,11 @@ def upload_document(
 
     return {"message": f"Document uploaded successfully with scope {scope}"}
 
+
 @app.post("/chat", response_model=ChatResponse)
 def generate_response(
-    request: QueryRequest,
-    current_user=Depends(get_current_user_with_role)
+        request: QueryRequest,
+        current_user=Depends(get_current_user_with_role)
 ):
     """
     Main chat endpoint with multi-vector retrieval + optional graph expansions,
@@ -792,11 +858,13 @@ def generate_response(
     if len(truncated_conversation) > MAX_CONVERSATION_CHARS:
         truncated_conversation = truncated_conversation[:MAX_CONVERSATION_CHARS] + " ... [truncated]"
 
-    # 5) Use browser
+    # 5) Use browser if judger says "YES"
     browser_context = ""
-    if should_use_browser(refined_query):
-        browser_context = browser_use_search(refined_query)
-        print(f"[Browser Context]: {browser_context}")
+    if should_use_browser(refined_query, llm, llm_lock):
+        print("[Judger] Using advanced browser agent...")
+        browser_context = run_browser_task_sync(refined_query, llm, max_steps=20)
+    else:
+        print("[Judger] No browsing needed.")
 
     # 5) Construct prompt
     prompt = f"""
@@ -839,6 +907,7 @@ def generate_response(
         "chat_id": chat_id
     }
 
+
 @app.post("/slack/events")
 async def slack_events(request: Request):
     if not await verify_slack_signature(request):
@@ -860,6 +929,7 @@ async def slack_events(request: Request):
 
     return JSONResponse(content={"message": "Event received"})
 
+
 @app.post("/slack/command")
 async def slack_command(request: Request, background_tasks: BackgroundTasks):
     if not await verify_slack_signature(request):
@@ -871,10 +941,11 @@ async def slack_command(request: Request, background_tasks: BackgroundTasks):
     background_tasks.add_task(process_slack_command, user_query, channel_id)
     return JSONResponse(content={"response_type": "ephemeral", "text": "Processing your request..."})
 
+
 @app.post("/update-role")
 def update_role(
-    request: UpdateRoleRequest,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        request: UpdateRoleRequest,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     if request.new_role not in ["user", "admin", "superadmin"]:
         raise HTTPException(status_code=400, detail="Invalid role")
@@ -894,6 +965,7 @@ def update_role(
         cursor.close()
         connection.close()
 
+
 @app.get("/admin/users")
 def get_all_users(current_user=Depends(role_required(["superadmin"]))):
     connection = psycopg2.connect(**DB_CONFIG)
@@ -907,11 +979,12 @@ def get_all_users(current_user=Depends(role_required(["superadmin"]))):
         cursor.close()
         connection.close()
 
+
 @app.post("/admin/users/{user_id}/change-username")
 def change_username(
-    user_id: int,
-    new_username: str = Form(...),
-    current_user=Depends(role_required(["superadmin"]))
+        user_id: int,
+        new_username: str = Form(...),
+        current_user=Depends(role_required(["superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -928,11 +1001,12 @@ def change_username(
         cursor.close()
         connection.close()
 
+
 @app.post("/admin/users/{user_id}/change-password")
 def change_password(
-    user_id: int,
-    new_password: str = Form(...),
-    current_user=Depends(role_required(["superadmin"]))
+        user_id: int,
+        new_password: str = Form(...),
+        current_user=Depends(role_required(["superadmin"]))
 ):
     hashed_password = hashlib.sha256(new_password.encode()).hexdigest()
     connection = psycopg2.connect(**DB_CONFIG)
@@ -950,10 +1024,11 @@ def change_password(
         cursor.close()
         connection.close()
 
+
 @app.get("/admin/users/{user_id}/chats")
 def get_user_chats_admin(
-    user_id: int,
-    current_user=Depends(role_required(["superadmin"]))
+        user_id: int,
+        current_user=Depends(role_required(["superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
@@ -975,10 +1050,11 @@ def get_user_chats_admin(
         cursor.close()
         connection.close()
 
+
 @app.post("/embed-documents")
 def embed_documents(
-    directory: str = Form(...),
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        directory: str = Form(...),
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     if not os.path.isdir(directory):
         raise HTTPException(status_code=400, detail="Invalid directory")
@@ -989,10 +1065,11 @@ def embed_documents(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/workspaces/{user_id}/list")
 def get_user_workspaces(
-    user_id: int,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        user_id: int,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     connection = psycopg2.connect(**DB_CONFIG)
     cursor = connection.cursor()
@@ -1013,21 +1090,23 @@ def get_user_workspaces(
         cursor.close()
         connection.close()
 
+
 @app.post("/configure-storage")
 def configure_storage(
-    storage_config: StorageConfig,
-    current_user=Depends(role_required(["superadmin"]))):
+        storage_config: StorageConfig,
+        current_user=Depends(role_required(["superadmin"]))):
     config_path = "storage_config.json"
     with open(config_path, "w") as f:
         json.dump(storage_config.dict(), f)
     return {"message": f"Storage configured successfully for {storage_config.datalake_type}"}
 
+
 @app.post("/local-datalake/upload-file")
 def local_datalake_upload_file(
-    file: UploadFile = File(...),
-    is_global: bool = Form(False),
-    workspace_id: Optional[int] = Form(None),
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        file: UploadFile = File(...),
+        is_global: bool = Form(False),
+        workspace_id: Optional[int] = Form(None),
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     """
     Endpoint to upload a file from the user's computer into the local datalake,
@@ -1071,7 +1150,7 @@ def local_datalake_upload_file(
         if not content:
             raise HTTPException(status_code=400, detail="Could not parse text from the file.")
 
-        # Split into chunks (using your existing chunk function)
+        # Split into chunks
         chunks = backend.chunk_text_with_langchain(content, chunk_size=1000, chunk_overlap=200)
 
         # Create base metadata for the Document nodes
@@ -1088,19 +1167,13 @@ def local_datalake_upload_file(
         sem_embeddings = []
 
         for ctext in chunks:
-            # This calls the same logic that:
-            #   - Summarizes chunk
-            #   - Creates doc node in Neo4j
-            #   - Possibly does entity extraction
-            #   - Stores embeddings in Milvus
             doc_id = backend.process_chunk(ctext, file_level_meta)
             doc_ids.append(doc_id)
 
-            # For doc-doc similarity, store the semantic embedding
             sem_emb = backend.semantic_embedding_model.encode([ctext], show_progress_bar=False)[0]
             sem_embeddings.append(sem_emb)
 
-        # Finally, link these new chunks to each other if they're similar
+        # Link these new chunks to each other if they're similar
         backend.compute_batch_similarities(doc_ids, sem_embeddings, threshold=0.7)
 
     return {
@@ -1110,16 +1183,18 @@ def local_datalake_upload_file(
         "local_path": local_path
     }
 
+
 # ----------------------------------------------------------------------------
 # NEW ENDPOINTS (do not modify anything above)
 # ----------------------------------------------------------------------------
 from fastapi import Form
 
+
 @app.post("/admin/copy-google-drive-to-local")
 def copy_google_drive_to_local(
-    folder_id: str = Form(...),
-    is_global: bool = Form(False),
-    current_user=Depends(role_required(["superadmin"]))
+        folder_id: str = Form(...),
+        is_global: bool = Form(False),
+        current_user=Depends(role_required(["superadmin"]))
 ):
     """
     Copy files from Google Drive into the local datalake folder,
@@ -1157,10 +1232,11 @@ def copy_google_drive_to_local(
         "is_global": is_global
     }
 
+
 @app.post("/admin/configure-storage-dashboard")
 def configure_storage_dashboard(
-    datalake_type: str = Form(...),
-    current_user=Depends(role_required(["superadmin"]))
+        datalake_type: str = Form(...),
+        current_user=Depends(role_required(["superadmin"]))
 ):
     """
     Minimal wrapper around /configure-storage for a simpler Admin UI
@@ -1175,6 +1251,7 @@ def configure_storage_dashboard(
 
     return {"message": f"Storage configured successfully for {datalake_type}"}
 
+
 # ----------------------------------------------------------------------------
 # LLM-BASED MODERATION HELPERS (ADDED CODE)
 # ----------------------------------------------------------------------------
@@ -1184,7 +1261,6 @@ def llm_moderation_check(query: str) -> bool:
     Use the LLM to decide if a query is ALLOWED or DISALLOWED based on a simple inline policy.
     Returns True if allowed, False if disallowed.
     """
-    # A minimal policy prompt:
     policy_prompt = f"""
 System: You are a strict content policy checker. The user input is below.
 If the user is discussing or requesting disallowed topics (like politics), respond EXACTLY 'DISALLOWED'.
@@ -1197,10 +1273,10 @@ User input:
     with llm_lock:
         classification = llm.invoke(policy_prompt).strip().upper()
 
-    # If the LLM says DISALLOWED, we return False. Otherwise True.
     if "DISALLOWED" in classification:
         return False
     return True
+
 
 # ----------------------------------------------------------------------------
 # EVALUATION CODE WITH TENSORBOARD
@@ -1213,16 +1289,19 @@ class RetrievalEvaluationItem(BaseModel):
     ground_truth_answer: Optional[str] = None
     system_answer: Optional[str] = None
 
+
 class EvaluationRequest(BaseModel):
     data: List[RetrievalEvaluationItem]
+
 
 rouge_metric = evaluate.load("rouge")
 meteor_metric = evaluate.load("meteor")
 bertscore_metric = evaluate.load("bertscore")
 
+
 def compute_precision_recall_f1(
-    relevant: set,
-    retrieved: set
+        relevant: set,
+        retrieved: set
 ):
     if not relevant and not retrieved:
         return 1.0, 1.0, 1.0
@@ -1238,11 +1317,13 @@ def compute_precision_recall_f1(
         f1 = 0.0
     return precision, recall, f1
 
+
 def compute_mrr(relevant_docs: set, retrieved_docs: List[str]) -> float:
     for idx, doc_id in enumerate(retrieved_docs):
         if doc_id in relevant_docs:
             return 1.0 / (idx + 1)
     return 0.0
+
 
 def compute_dcg(relevance_list: List[int]) -> float:
     dcg = 0.0
@@ -1250,6 +1331,7 @@ def compute_dcg(relevance_list: List[int]) -> float:
         if rel > 0:
             dcg += rel / math.log2(i + 2)
     return dcg
+
 
 def compute_ndcg(relevant_docs: set, retrieved_docs: List[str], k: Optional[int] = None) -> float:
     if not k:
@@ -1262,6 +1344,7 @@ def compute_ndcg(relevant_docs: set, retrieved_docs: List[str], k: Optional[int]
     if idcg == 0.0:
         return 1.0 if dcg == 0.0 else 0.0
     return dcg / idcg
+
 
 def compute_text_metrics(predictions: List[str], references: List[str]):
     rouge_results = rouge_metric.compute(predictions=predictions, references=references)
@@ -1278,9 +1361,10 @@ def compute_text_metrics(predictions: List[str], references: List[str]):
     results_summary["rougeL_f"] = rouge_results["rougeL"]
     results_summary["meteor"] = meteor_results["meteor"]
     results_summary["bertscore_precision"] = sum(bert_results["precision"]) / len(bert_results["precision"])
-    results_summary["bertscore_recall"]    = sum(bert_results["recall"]) / len(bert_results["recall"])
-    results_summary["bertscore_f1"]        = sum(bert_results["f1"]) / len(bert_results["f1"])
+    results_summary["bertscore_recall"] = sum(bert_results["recall"]) / len(bert_results["recall"])
+    results_summary["bertscore_f1"] = sum(bert_results["f1"]) / len(bert_results["f1"])
     return results_summary
+
 
 @app.post("/evaluate")
 def evaluate_system(request_data: EvaluationRequest):
@@ -1294,8 +1378,7 @@ def evaluate_system(request_data: EvaluationRequest):
     For each item, this endpoint:
       1. Refines the query and retrieves documents.
       2. Constructs a prompt and generates a new system answer using the LLM.
-      3. Computes retrieval metrics (using the provided retrieved_docs) and
-         generative (text) metrics comparing the new answer with the ground truth.
+      3. Computes retrieval metrics and generative (text) metrics.
       4. Logs all metrics to TensorBoard and returns the aggregated metrics
          along with the generated answers.
     """
@@ -1304,12 +1387,11 @@ def evaluate_system(request_data: EvaluationRequest):
 
     data = request_data.data
 
-    # Create a TensorBoard SummaryWriter (using a timestamped directory)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = f"runs/evaluation_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
 
-    # Initialize accumulators for retrieval metrics
+    # Retrieval accumulators
     sum_precision = 0.0
     sum_recall = 0.0
     sum_f1 = 0.0
@@ -1317,14 +1399,12 @@ def evaluate_system(request_data: EvaluationRequest):
     sum_ndcg = 0.0
     retrieval_count = 0
 
-    # For generative metrics (text evaluation)
+    # Generative accumulators
     all_predictions = []
     all_references = []
     generated_answers = []
 
-    # Process each evaluation item
     for idx, item in enumerate(data):
-        # --- Retrieval metrics are computed based on provided docs ---
         relevant_docs = set(item.ground_truth_docs)
         retrieved_docs = item.retrieved_docs
         if relevant_docs or retrieved_docs:
@@ -1340,20 +1420,16 @@ def evaluate_system(request_data: EvaluationRequest):
         else:
             p = r = f1 = mrr = ndcg = 1.0
 
-        # Log per-item retrieval metrics
         writer.add_scalar("per_item/precision", p, idx)
         writer.add_scalar("per_item/recall", r, idx)
         writer.add_scalar("per_item/f1", f1, idx)
         writer.add_scalar("per_item/mrr", mrr, idx)
         writer.add_scalar("per_item/ndcg", ndcg, idx)
 
-        # --- Generate a new system answer ---
-        # Assume an empty conversation context for evaluation.
         conversation_so_far = ""
         refined_query = refine_query(item.query, conversation_so_far)
         docs = get_hybrid_plus_cypher_docs(refined_query, top_k=3, use_cypher_expansion=True)
 
-        # Build a context string from the retrieved documents
         context_text = ""
         for doc in docs:
             piece = f"{doc['content']}\n(Source: {doc['filename']})\n\n"
@@ -1363,7 +1439,6 @@ def evaluate_system(request_data: EvaluationRequest):
                 context_text += "... [truncated]"
                 break
 
-        # Construct the prompt using the query and context
         prompt = f"""
         You are a helpful assistant who provides concise, step-by-step solutions.
         Conversation so far: {conversation_so_far}
@@ -1372,21 +1447,17 @@ def evaluate_system(request_data: EvaluationRequest):
         Your concise answer:
         """.strip()
 
-        # Generate the new system answer using your LLM
         with llm_lock:
             generated_answer = llm.invoke(prompt).strip()
         generated_answer = generated_answer.encode('utf-8', errors='replace').decode('utf-8')
 
-        # Fill the evaluation item with the newly generated answer
         item.system_answer = generated_answer
         generated_answers.append(generated_answer)
 
-        # For generative metrics, accumulate ground truth and generated answer
         if item.ground_truth_answer:
             all_references.append(item.ground_truth_answer)
             all_predictions.append(generated_answer)
 
-    # Compute aggregated retrieval metrics
     if retrieval_count > 0:
         avg_precision = sum_precision / retrieval_count
         avg_recall = sum_recall / retrieval_count
@@ -1402,7 +1473,6 @@ def evaluate_system(request_data: EvaluationRequest):
     writer.add_scalar("retrieval/mrr", avg_mrr, 0)
     writer.add_scalar("retrieval/ndcg", avg_ndcg, 0)
 
-    # Compute generative (text) metrics if ground truth answers exist
     if all_predictions and all_references:
         generative_metrics = compute_text_metrics(all_predictions, all_references)
         writer.add_scalar("generative/rouge1_f", generative_metrics["rouge1_f"], 0)
@@ -1438,12 +1508,14 @@ def evaluate_system(request_data: EvaluationRequest):
         "generated_system_answers": generated_answers
     }
 
+
 # ----------------------------------------------------------------------------
 # ADD THESE FOR YOUR MODERATION CONFIG
 # ----------------------------------------------------------------------------
 
 class ModerationConfig(BaseModel):
     moderation_policy_prompt: str = ""
+
 
 @app.get("/admin/moderation-config")
 def get_moderation_config(current_user=Depends(role_required(["superadmin"]))):
@@ -1457,10 +1529,11 @@ def get_moderation_config(current_user=Depends(role_required(["superadmin"]))):
         data = json.load(f)
     return data
 
+
 @app.post("/admin/moderation-config")
 def update_moderation_config(
-    new_config: ModerationConfig,
-    current_user=Depends(role_required(["superadmin"]))
+        new_config: ModerationConfig,
+        current_user=Depends(role_required(["superadmin"]))
 ):
     """
     Updates moderation_config.json with new data from superadmin.
@@ -1476,36 +1549,23 @@ def update_moderation_config(
 # ----------------------------------------------------------------------------
 import secrets
 
+
 class ApiKeyCreateRequest(BaseModel):
-    name: str  # e.g. "Popup Integration" or "Marketing Website"
+    name: str
     is_global: bool = True
-    workspace_id: Optional[int] = None  # if you want to limit usage to a workspace, set this
+    workspace_id: Optional[int] = None
+
 
 @app.post("/admin/api-keys/generate")
 def generate_api_key(
-    req: ApiKeyCreateRequest,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        req: ApiKeyCreateRequest,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     """
     Generates a new random API key for external usage, optionally tied to a workspace or global.
-    Stores it in 'api_keys' table (which you must create in DB).
-    Returns the raw key_value once (make sure to copy it!).
+    Stores it in 'api_keys' table (which you must create).
     """
-
-    # Make a random hex token
-    new_key_value = secrets.token_hex(32)  # e.g. 64-char hex string
-
-    # Insert into a hypothetical 'api_keys' table.
-    # You must create a table in Postgres like:
-    # CREATE TABLE IF NOT EXISTS api_keys (
-    #   id SERIAL PRIMARY KEY,
-    #   name TEXT,
-    #   key_value TEXT UNIQUE,
-    #   is_global BOOLEAN DEFAULT TRUE,
-    #   workspace_id INT,
-    #   created_by INT,
-    #   created_at TIMESTAMP DEFAULT NOW()
-    # );
+    new_key_value = secrets.token_hex(32)
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
@@ -1531,8 +1591,9 @@ def generate_api_key(
         "api_key_value": new_key_value,
         "is_global": req.is_global,
         "workspace_id": req.workspace_id,
-        "message": "API Key generated successfully. Please copy the api_key_value now, as it won't be shown again."
+        "message": "API Key generated successfully. Copy the value now as it won't be shown again."
     }
+
 
 @app.get("/admin/api-keys")
 def list_api_keys(current_user=Depends(role_required(["admin", "superadmin"]))):
@@ -1540,12 +1601,10 @@ def list_api_keys(current_user=Depends(role_required(["admin", "superadmin"]))):
     Lists existing API keys from the 'api_keys' table.
     - If role == 'superadmin', show all keys.
     - If role == 'admin', show only keys created_by this user.
-    For security reasons, consider hiding the raw key_value in production.
     """
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        # If superadmin, see all keys
         if current_user["role"] == "superadmin":
             query = """
                 SELECT id, name, key_value, is_global, workspace_id, created_by, created_at
@@ -1554,7 +1613,6 @@ def list_api_keys(current_user=Depends(role_required(["admin", "superadmin"]))):
             """
             cursor.execute(query)
         else:
-            # Admin: see only your own keys
             query = """
                 SELECT id, name, key_value, is_global, workspace_id, created_by, created_at
                 FROM api_keys
@@ -1581,40 +1639,39 @@ def list_api_keys(current_user=Depends(role_required(["admin", "superadmin"]))):
     finally:
         cursor.close()
         connection.close()
+
+
 from fastapi import Header
+
 
 @app.post("/external-chat", response_model=ChatResponse)
 def external_chat(
-    request: QueryRequest,
-    x_api_key: str = Header(None)
+        request: QueryRequest,
+        x_api_key: str = Header(None)
 ):
     """
     Minimal external endpoint that reuses the /chat logic.
-    1) We validate the API key from 'api_keys' table.
-    2) If valid, we pass a 'fake' user object with user_id=0 into the existing /chat function.
-    3) The /chat logic is reused exactly.
+    1) Validate API key from 'api_keys' table.
+    2) If valid, pass a 'fake' user dict with user_id=0 to reuse the /chat logic.
     """
-
-    # 1) Check if x_api_key is present
     if not x_api_key:
         raise HTTPException(status_code=403, detail="Missing X-Api-Key header.")
 
-    # 2) Validate the API key from your database
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT id, is_global, workspace_id
             FROM api_keys
             WHERE key_value = %s
             LIMIT 1
-        """, (x_api_key,))
+            """,
+            (x_api_key,)
+        )
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=403, detail="Invalid or unknown API key.")
-
-        # If you want to enforce is_global/workspace here, do so
-        # e.g. is_global = row[1], workspace_id = row[2]
     except Exception as e:
         cursor.close()
         connection.close()
@@ -1623,45 +1680,40 @@ def external_chat(
         cursor.close()
         connection.close()
 
-    # 3) Create a "fake" user dict with user_id=0, so the /chat logic sees "someone"
-    #    You can pick any role that passes your internal checks. Typically "admin" or "superadmin."
     fake_user = {"user_id": 0, "role": "user", "workspace_id": None}
-
-    # 4) Reuse the existing generate_response(...) function
-    #    because it takes (request, current_user=...).
-    #    The "Depends(get_current_user_with_role)" will be skipped when we call it directly.
     return generate_response(request, fake_user)
+
 
 @app.delete("/admin/api-keys/{id}/revoke")
 def revoke_api_key(
-    id: int,
-    current_user=Depends(role_required(["admin", "superadmin"]))
+        id: int,
+        current_user=Depends(role_required(["admin", "superadmin"]))
 ):
     """
     Revokes (deletes) the API key with the given ID from the api_keys table.
-    - If role == 'superadmin', can revoke any key.
-    - If role == 'admin', can only revoke keys they created themselves.
+    - superadmin can revoke any key.
+    - admin can only revoke keys they created themselves.
     """
     connection = psycopg2.connect(**DB_CONFIG, options='-c client_encoding=UTF8')
     cursor = connection.cursor()
     try:
-        # 1) Check if the key exists
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT id, created_by
             FROM api_keys
             WHERE id = %s
-        """, (id,))
+            """,
+            (id,)
+        )
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="API key not found")
 
         key_id, created_by = row
 
-        # 2) If the current user is 'admin', ensure they own this key
         if current_user["role"] == "admin" and created_by != current_user["user_id"]:
             raise HTTPException(status_code=403, detail="You do not have permission to revoke this key")
 
-        # 3) Perform the delete
         cursor.execute("DELETE FROM api_keys WHERE id = %s", (key_id,))
         connection.commit()
 
